@@ -1,1 +1,155 @@
-# Loan-Approval-Prediction
+import pandas as pd
+import numpy as np
+import joblib
+import os
+
+# sklearn imports
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    confusion_matrix, classification_report
+)
+import sklearn
+from packaging import version
+
+# Gradio
+import gradio as gr
+
+# ==== USER: dataset path ====
+DATASET_PATH = "loan_data_set.csv"   # <-- change to your dataset path
+
+# ==== Load Data ====
+if not os.path.exists(DATASET_PATH):
+    raise FileNotFoundError(f"Dataset not found at {DATASET_PATH}. Please update path.")
+df = pd.read_csv(DATASET_PATH)
+print("Data shape:", df.shape)
+print("Columns:", df.columns.tolist())
+
+# ==== Detect target column ====
+possible_targets = [c for c in df.columns if c.lower() in (
+    'not.fully.paid','not_fully_paid','loan_status','default','target','y')]
+if possible_targets:
+    target_col = possible_targets[0]
+else:
+    target_col = df.columns[-1]
+print("Using target column:", target_col)
+
+y = df[target_col]
+X = df.drop(columns=[target_col])
+
+# Simple conversion if target is object
+if y.dtype == object:
+    y = y.replace({"Fully Paid":0,"Charged Off":1,"paid":0,"not paid":1})
+    try:
+        y = pd.to_numeric(y)
+    except:
+        y = (y != y.unique()[0]).astype(int)
+
+# Drop obvious ID columns
+for id_col in ['id','loan_id','member_id']:
+    if id_col in X.columns:
+        X = X.drop(columns=[id_col])
+
+# ==== Column types ====
+numeric_cols = X.select_dtypes(include=['int64','float64']).columns.tolist()
+cat_cols = X.select_dtypes(include=['object','category','bool']).columns.tolist()
+print("Numeric:", numeric_cols)
+print("Categorical:", cat_cols)
+
+# ==== Train/test split ====
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# ==== Preprocessing pipelines ====
+numeric_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())
+])
+
+# Choose correct param depending on sklearn version
+if version.parse(sklearn.__version__) >= version.parse("1.2"):
+    ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+else:
+    ohe = OneHotEncoder(handle_unknown='ignore', sparse=False)
+
+cat_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+    ('onehot', ohe)
+])
+
+preprocessor = ColumnTransformer(transformers=[
+    ('num', numeric_transformer, numeric_cols),
+    ('cat', cat_transformer, cat_cols)
+])
+
+# ==== Model ====
+rf = RandomForestClassifier(n_estimators=200, random_state=42, class_weight='balanced')
+model_pipeline = Pipeline(steps=[
+    ('preprocessor', preprocessor),
+    ('classifier', rf)
+])
+
+# ==== Train & evaluate ====
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+cv_scores = cross_val_score(model_pipeline, X_train, y_train, cv=cv, scoring='roc_auc', n_jobs=-1)
+print("CV ROC AUC:", cv_scores.mean())
+
+model_pipeline.fit(X_train, y_train)
+y_pred = model_pipeline.predict(X_test)
+y_proba = model_pipeline.predict_proba(X_test)[:,1]
+
+print("\nAccuracy:", accuracy_score(y_test, y_pred))
+print("Precision:", precision_score(y_test, y_pred))
+print("Recall:", recall_score(y_test, y_pred))
+print("F1:", f1_score(y_test, y_pred))
+print("ROC AUC:", roc_auc_score(y_test, y_proba))
+print("\nConfusion matrix:\n", confusion_matrix(y_test, y_pred))
+print("\nClassification report:\n", classification_report(y_test, y_pred))
+
+# ==== Save model ====
+os.makedirs("models", exist_ok=True)
+joblib.dump(model_pipeline, "models/loan_model_pipeline.joblib")
+print("✅ Model saved to models/loan_model_pipeline.joblib")
+
+# ==== Gradio UI ====
+loaded_pipe = joblib.load("models/loan_model_pipeline.joblib")
+
+def predict_loan(**kwargs):
+    data = pd.DataFrame([kwargs])
+    for c in numeric_cols + cat_cols:
+        if c not in data.columns:
+            data[c] = np.nan
+    data = data[numeric_cols + cat_cols]
+    pred = loaded_pipe.predict(data)[0]
+    prob = loaded_pipe.predict_proba(data)[0][1]
+
+    if pred == 0:
+        return f"✅ Loan Approved (Low Risk)\n📊 Probability of Default: {round(prob,3)}"
+    else:
+        return f"❌ Loan Not Approved (High Risk)\n📊 Probability of Default: {round(prob,3)}"
+
+# Inputs
+gr_inputs = []
+for col in numeric_cols:
+    gr_inputs.append(gr.Number(label=col))
+for col in cat_cols:
+    gr_inputs.append(gr.Textbox(label=col))
+
+with gr.Blocks() as demo:
+    gr.Markdown("## 💰 Loan Approval Prediction System")
+    out = gr.Textbox(label="Result", interactive=False)
+    btn = gr.Button("🔮 Predict Loan Status")
+    btn.click(
+        lambda *args: predict_loan(**{
+            **{numeric_cols[i]: args[i] for i in range(len(numeric_cols))},
+            **{cat_cols[j]: args[len(numeric_cols)+j] for j in range(len(cat_cols))}}),
+        inputs=gr_inputs, outputs=out
+    )
+
+demo.launch()
